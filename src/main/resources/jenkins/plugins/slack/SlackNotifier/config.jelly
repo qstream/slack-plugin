@@ -33,6 +33,14 @@
         <f:checkbox name="slackNotifyBackToNormal" value="true" checked="${instance.getNotifyBackToNormal()}"/>
     </f:entry>
 
+     <j:if test="${descriptor.isMatrixProject(it)}">
+        <f:entry title="${%Trigger For Matrix Projects}" field="matrixTriggerMode">
+            <f:enum field="matrixTriggerMode">
+                ${it.description}
+            </f:enum>
+        </f:entry>
+     </j:if>
+
     <f:advanced>
         <f:entry title="Notify Repeated Failure">
             <f:checkbox name="slackNotifyRepeatedFailure" value="true"

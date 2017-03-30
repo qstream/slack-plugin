@@ -5,11 +5,12 @@ import com.cloudbees.plugins.credentials.domains.HostnameRequirement;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.Launcher;
-import hudson.model.AbstractBuild;
-import hudson.model.AbstractProject;
-import hudson.model.BuildListener;
-import hudson.model.Item;
-import hudson.model.Descriptor;
+import hudson.model.*;
+import hudson.matrix.MatrixAggregatable;
+import hudson.matrix.MatrixAggregator;
+import hudson.matrix.MatrixBuild;
+import hudson.matrix.MatrixProject;
+import hudson.matrix.MatrixRun;
 import hudson.model.listeners.ItemListener;
 import hudson.security.ACL;
 import hudson.tasks.BuildStepDescriptor;
@@ -37,7 +38,7 @@ import java.util.logging.Logger;
 
 import static com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials;
 
-public class SlackNotifier extends Notifier {
+public class SlackNotifier extends Notifier implements MatrixAggregatable {
 
     private static final Logger logger = Logger.getLogger(SlackNotifier.class.getName());
 
@@ -62,6 +63,7 @@ public class SlackNotifier extends Notifier {
     private CommitInfoChoice commitInfoChoice;
     private boolean includeCustomMessage;
     private String customMessage;
+    private MatrixTriggerMode matrixTriggerMode;
 
     @Override
     public DescriptorImpl getDescriptor() {
@@ -227,6 +229,15 @@ public class SlackNotifier extends Notifier {
         this.notifyBackToNormal = notifyBackToNormal;
     }
 
+    public MatrixTriggerMode getMatrixTriggerMode() {
+        return matrixTriggerMode == null ? MatrixTriggerMode.BOTH : matrixTriggerMode;
+    }
+
+    @DataBoundSetter
+    public void setMatrixTriggerMode(MatrixTriggerMode matrixTriggerMode) {
+        this.matrixTriggerMode = matrixTriggerMode;
+    }
+
     @DataBoundSetter
     public void setIncludeTestSummary(boolean includeTestSummary) {
         this.includeTestSummary = includeTestSummary;
@@ -256,7 +267,7 @@ public class SlackNotifier extends Notifier {
                          final String sendAs, final boolean startNotification, final boolean notifyAborted, final boolean notifyFailure,
                          final boolean notifyNotBuilt, final boolean notifySuccess, final boolean notifyUnstable, final boolean notifyRegression, final boolean notifyBackToNormal,
                          final boolean notifyRepeatedFailure, final boolean includeTestSummary, final boolean includeFailedTests,
-                         CommitInfoChoice commitInfoChoice, boolean includeCustomMessage, String customMessage) {
+                         CommitInfoChoice commitInfoChoice, boolean includeCustomMessage, String customMessage, MatrixTriggerMode matrixTriggerMode) {
         super();
         this.baseUrl = baseUrl;
         if(this.baseUrl != null && !this.baseUrl.isEmpty() && !this.baseUrl.endsWith("/")) {
@@ -282,6 +293,7 @@ public class SlackNotifier extends Notifier {
         this.commitInfoChoice = commitInfoChoice;
         this.includeCustomMessage = includeCustomMessage;
         this.customMessage = customMessage;
+        this.matrixTriggerMode = matrixTriggerMode;
     }
 
     public BuildStepMonitor getRequiredMonitorService() {
@@ -337,7 +349,7 @@ public class SlackNotifier extends Notifier {
 
     @Override
     public boolean prebuild(AbstractBuild<?, ?> build, BuildListener listener) {
-        if (startNotification) {
+        if (startNotification && (!(build instanceof MatrixRun) || getMatrixTriggerMode().forChild)) {
             Map<Descriptor<Publisher>, Publisher> map = build.getProject().getPublishersList().toMap();
             for (Publisher publisher : map.values()) {
                 if (publisher instanceof SlackNotifier) {
@@ -347,6 +359,48 @@ public class SlackNotifier extends Notifier {
             }
         }
         return super.prebuild(build, listener);
+    }
+
+    private void notifyOnBuildComplete(AbstractBuild<?, ?> build, BuildListener listener) {
+        logger.fine("Creating build completed notification");
+
+        if (startNotification && (!(build instanceof MatrixRun) || getMatrixTriggerMode().forChild)) {
+            Map<Descriptor<Publisher>, Publisher> map = build.getProject().getPublishersList().toMap();
+            for (Publisher publisher : map.values()) {
+                if (publisher instanceof SlackNotifier) {
+                    logger.info("Invoking Started...");
+                    new ActiveNotifier((SlackNotifier) publisher, listener).started(build);
+                }
+            }
+        }
+    }
+
+    @Override
+    public MatrixAggregator createAggregator(MatrixBuild build, Launcher launcher, BuildListener listener) {
+        return new MatrixAggregator(build, launcher, listener) {
+
+            @Override
+            public boolean startBuild() throws InterruptedException, IOException {
+                if (getMatrixTriggerMode().forParent) {
+                    Map<Descriptor<Publisher>, Publisher> map = build.getProject().getPublishersList().toMap();
+                    for (Publisher publisher : map.values()) {
+                        if (publisher instanceof SlackNotifier) {
+                            logger.info("Invoking Started...");
+                            new ActiveNotifier((SlackNotifier) publisher, listener).started(build);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            @Override
+            public boolean endBuild() throws InterruptedException, IOException {
+                if (getMatrixTriggerMode().forParent) {
+                    notifyOnBuildComplete(build, listener);
+                }
+                return true;
+            }
+        };
     }
 
     @Extension
@@ -418,48 +472,14 @@ public class SlackNotifier extends Notifier {
             return true;
         }
 
-        @Override
-        public SlackNotifier newInstance(StaplerRequest sr, JSONObject json) {
-            String baseUrl = sr.getParameter("slackBaseUrl");
-            if(baseUrl != null && !baseUrl.isEmpty() && ! baseUrl.endsWith("/")) {
-                baseUrl += "/";
-            }
-            String teamDomain = sr.getParameter("slackTeamDomain");
-            String token = sr.getParameter("slackToken");
-            String tokenCredentialId = json.getString("tokenCredentialId");
-            boolean botUser = "true".equals(sr.getParameter("slackBotUser"));
-            String room = sr.getParameter("slackRoom");
-            boolean startNotification = "true".equals(sr.getParameter("slackStartNotification"));
-            boolean notifySuccess = "true".equals(sr.getParameter("slackNotifySuccess"));
-            boolean notifyAborted = "true".equals(sr.getParameter("slackNotifyAborted"));
-            boolean notifyNotBuilt = "true".equals(sr.getParameter("slackNotifyNotBuilt"));
-            boolean notifyUnstable = "true".equals(sr.getParameter("slackNotifyUnstable"));
-            boolean notifyRegression = "true".equals(sr.getParameter("slackNotifyRegression"));
-            boolean notifyFailure = "true".equals(sr.getParameter("slackNotifyFailure"));
-            boolean notifyBackToNormal = "true".equals(sr.getParameter("slackNotifyBackToNormal"));
-            boolean notifyRepeatedFailure = "true".equals(sr.getParameter("slackNotifyRepeatedFailure"));
-            boolean includeTestSummary = "true".equals(sr.getParameter("includeTestSummary"));
-            boolean includeFailedTests = "true".equals(sr.getParameter("includeFailedTests"));
-            CommitInfoChoice commitInfoChoice = CommitInfoChoice.forDisplayName(sr.getParameter("slackCommitInfoChoice"));
-            boolean includeCustomMessage = "on".equals(sr.getParameter("includeCustomMessage"));
-            String customMessage = sr.getParameter("customMessage");
-            return new SlackNotifier(baseUrl, teamDomain, token, botUser, room, tokenCredentialId, sendAs, startNotification, notifyAborted,
-                    notifyFailure, notifyNotBuilt, notifySuccess, notifyUnstable, notifyRegression, notifyBackToNormal, notifyRepeatedFailure,
-                    includeTestSummary, includeFailedTests, commitInfoChoice, includeCustomMessage, customMessage);
+        public boolean isMatrixProject(Object project) {
+            return project instanceof MatrixProject;
         }
 
         @Override
         public boolean configure(StaplerRequest sr, JSONObject formData) throws FormException {
-            baseUrl = sr.getParameter("slackBaseUrl");
-            if(baseUrl != null && !baseUrl.isEmpty() && ! baseUrl.endsWith("/")) {
-                baseUrl += "/";
-            }
-            teamDomain = sr.getParameter("slackTeamDomain");
-            token = sr.getParameter("slackToken");
-            tokenCredentialId = formData.getJSONObject("slack").getString("tokenCredentialId");
-            botUser = "true".equals(sr.getParameter("slackBotUser"));
-            room = sr.getParameter("slackRoom");
-            sendAs = sr.getParameter("slackSendAs");
+            sr.bindJSON(this, formData);
+
             save();
             return super.configure(sr, formData);
         }
